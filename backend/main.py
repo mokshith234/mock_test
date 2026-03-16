@@ -77,7 +77,7 @@ class GetHistoryRequest(BaseModel):
 def root():
     return {"status": "PrepAI backend running", "version": "1.0.0"}
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
