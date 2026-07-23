@@ -76,6 +76,10 @@ class EvaluateAnswerRequest(BaseModel):
     user_answer: str
     session_id: str
 
+class SaveUserRequest(BaseModel):
+    email: str
+    name: str
+
 class SaveSessionRequest(BaseModel):
     session_id: str
     user_id: Optional[str] = None
@@ -198,6 +202,32 @@ Evaluate thoroughly. Respond ONLY with valid JSON:
     evaluation = parse_json_response(raw)
     evaluation["session_id"] = req.session_id
     return evaluation
+
+# ─────────────────────────────────────────
+#  SAVE USER (IMMEDIATE ON START)
+# ─────────────────────────────────────────
+@app.post("/api/user/save")
+async def save_user(req: SaveUserRequest):
+    if not supabase:
+        logger.warning("Supabase client not initialized. User not saved to database.")
+        return {"status": "skipped", "message": "Database not configured"}
+
+    clean_email = req.email.strip().lower()
+    clean_name = req.name.strip()
+    logger.info(f"Saving user info for email: '{clean_email}', name: '{clean_name}'")
+
+    try:
+        user_data = {
+            "email": clean_email,
+            "name": clean_name,
+            "last_active": datetime.utcnow().isoformat()
+        }
+        response = supabase.table("users").upsert(user_data, on_conflict="email").execute()
+        logger.info(f"Supabase user save success: {response}")
+        return {"status": "saved", "email": clean_email, "name": clean_name}
+    except Exception as e:
+        logger.error(f"ERROR saving user to Supabase: {str(e)}", exc_info=True)
+        return {"status": "error", "detail": str(e)}
 
 # ─────────────────────────────────────────
 #  SAVE SESSION (FIXED USER_ID & SUPABASE INSERT)
