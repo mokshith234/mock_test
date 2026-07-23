@@ -15,8 +15,15 @@ import uuid
 from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()
+
+# ─────────────────────────────────────────
+#  LOGGING
+# ─────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
 #  INIT
@@ -37,6 +44,12 @@ GROQ_MODEL    = "llama-3.3-70b-versatile"
 
 SUPABASE_URL  = os.getenv("SUPABASE_URL")
 SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY")
+
+# Verify Supabase config
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.error("SUPABASE_URL or SUPABASE_SERVICE_KEY not configured")
+else:
+    logger.info(f"Supabase configured: {SUPABASE_URL[:30]}...")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -196,6 +209,9 @@ Scoring guide:
 # ─────────────────────────────────────────
 @app.post("/api/session/save")
 async def save_session(req: SaveSessionRequest):
+    logger.info(f"DEBUG: Saving session - {req.session_id}, user_id: {req.user_id}")
+    logger.info(f"DEBUG: Session data - topics: {req.topics}, difficulty: {req.difficulty}, score: {req.score_pct}%")
+    
     try:
         session_data = {
             "session_id":        req.session_id,
@@ -211,9 +227,14 @@ async def save_session(req: SaveSessionRequest):
             "results":           req.results,
             "created_at":        datetime.utcnow().isoformat(),
         }
-        supabase.table("sessions").insert(session_data).execute()
+        logger.info(f"DEBUG: Prepared session data: {session_data}")
+        
+        response = supabase.table("sessions").insert(session_data).execute()
+        logger.info(f"DEBUG: Supabase insert response: {response}")
+        
         return {"status": "saved", "session_id": req.session_id}
     except Exception as e:
+        logger.error(f"ERROR saving session: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to save session: {str(e)}")
 
 # ─────────────────────────────────────────
@@ -222,6 +243,7 @@ async def save_session(req: SaveSessionRequest):
 @app.get("/api/history/{user_id}")
 async def get_history(user_id: str, limit: int = 10):
     try:
+        logger.info(f"DEBUG: Fetching history for user: {user_id}")
         resp = (
             supabase.table("sessions")
             .select("session_id,topics,difficulty,total_questions,correct,partial,wrong,score_pct,duration_seconds,created_at")
@@ -230,8 +252,10 @@ async def get_history(user_id: str, limit: int = 10):
             .limit(limit)
             .execute()
         )
+        logger.info(f"DEBUG: Retrieved {len(resp.data)} sessions")
         return {"sessions": resp.data}
     except Exception as e:
+        logger.error(f"ERROR fetching history: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────
@@ -240,6 +264,7 @@ async def get_history(user_id: str, limit: int = 10):
 @app.get("/api/session/{session_id}")
 async def get_session(session_id: str):
     try:
+        logger.info(f"DEBUG: Fetching session: {session_id}")
         resp = (
             supabase.table("sessions")
             .select("*")
@@ -247,8 +272,10 @@ async def get_session(session_id: str):
             .single()
             .execute()
         )
+        logger.info(f"DEBUG: Retrieved session")
         return resp.data
     except Exception as e:
+        logger.error(f"ERROR fetching session: {str(e)}", exc_info=True)
         raise HTTPException(status_code=404, detail="Session not found")
 
 # ─────────────────────────────────────────
@@ -257,6 +284,7 @@ async def get_session(session_id: str):
 @app.get("/api/leaderboard")
 async def get_leaderboard(topic: Optional[str] = None, limit: int = 10):
     try:
+        logger.info(f"DEBUG: Fetching leaderboard, topic: {topic}")
         query = (
             supabase.table("sessions")
             .select("user_id,score_pct,topics,total_questions,created_at")
@@ -266,6 +294,8 @@ async def get_leaderboard(topic: Optional[str] = None, limit: int = 10):
         if topic:
             query = query.contains("topics", [topic])
         resp = query.execute()
+        logger.info(f"DEBUG: Retrieved {len(resp.data)} leaderboard entries")
         return {"leaderboard": resp.data}
     except Exception as e:
+        logger.error(f"ERROR fetching leaderboard: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
