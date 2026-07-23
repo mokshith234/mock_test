@@ -42,18 +42,23 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL    = "llama-3.3-70b-versatile"
 
 SUPABASE_URL  = os.getenv("SUPABASE_URL")
-SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+SUPABASE_KEY  = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY") or 
+    os.getenv("SUPABASE_SERVICE_KEY") or 
+    os.getenv("SUPABASE_KEY") or 
+    os.getenv("SUPABASE_ANON_KEY")
+)
 
 supabase: Optional[Client] = None
 
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info(f"Supabase successfully connected: {SUPABASE_URL[:30]}...")
+        logger.info(f"Supabase successfully connected to: {SUPABASE_URL[:30]}...")
     except Exception as e:
         logger.error(f"Failed to initialize Supabase client: {e}")
 else:
-    logger.warning("SUPABASE_URL or SUPABASE_SERVICE_KEY missing from environment variables.")
+    logger.warning("SUPABASE_URL or SUPABASE_KEY missing from environment variables.")
 
 # ─────────────────────────────────────────
 #  MODELS
@@ -202,8 +207,8 @@ async def save_session(req: SaveSessionRequest):
         logger.warning("Supabase client not initialized. Session not saved to database.")
         return {"status": "skipped", "message": "Database not configured"}
 
-    # Sanitize user_id
-    clean_user_id = req.user_id.strip() if req.user_id and req.user_id.strip() else "anonymous"
+    # Sanitize user_id (lowercase email or string)
+    clean_user_id = req.user_id.strip().lower() if req.user_id and req.user_id.strip() else "anonymous"
     logger.info(f"Saving session {req.session_id} for user_id: '{clean_user_id}'")
 
     try:
@@ -238,7 +243,7 @@ async def get_history(user_id: str, limit: int = 10):
     if not supabase:
         return {"sessions": []}
 
-    clean_user_id = user_id.strip()
+    clean_user_id = user_id.strip().lower()
     try:
         logger.info(f"Fetching history for user_id: '{clean_user_id}'")
         resp = (
