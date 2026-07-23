@@ -259,7 +259,13 @@ async def save_session(req: SaveSessionRequest):
             "created_at":        datetime.utcnow().isoformat(),
         }
 
-        response = supabase.table("sessions").insert(session_data).execute()
+        try:
+            response = supabase.table("sessions").insert(session_data).execute()
+        except Exception as insert_err:
+            logger.warning(f"Initial session insert failed (possibly missing user_name column), retrying fallback: {insert_err}")
+            session_data_fallback = {k: v for k, v in session_data.items() if k != "user_name"}
+            response = supabase.table("sessions").insert(session_data_fallback).execute()
+
         logger.info(f"Supabase insert success: {response}")
         return {"status": "saved", "session_id": req.session_id, "user_id": clean_user_id}
 
