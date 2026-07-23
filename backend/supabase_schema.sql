@@ -1,9 +1,9 @@
 -- -------------------------------------------------------------
 -- PrepAI — Supabase Table & RLS Setup Script
--- Run this script in the Supabase SQL Editor (Database -> SQL Editor)
+-- Idempotent & Safe Script (Can be re-run anytime safely)
 -- -------------------------------------------------------------
 
--- 1. Create the USERS table (Stores user name & email immediately on start)
+-- 1. Create USERS table
 CREATE TABLE IF NOT EXISTS public.users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email TEXT UNIQUE NOT NULL,
@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS public.users (
     last_active TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 2. Create the SESSIONS table (Stores full mock test results)
+-- 2. Create SESSIONS table
 CREATE TABLE IF NOT EXISTS public.sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id TEXT UNIQUE NOT NULL,
@@ -30,16 +30,16 @@ CREATE TABLE IF NOT EXISTS public.sessions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 3. Create indexes for performance
+-- 3. Indexes
 CREATE INDEX IF NOT EXISTS idx_users_email ON public.users (email);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON public.sessions (user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON public.sessions (created_at DESC);
 
--- 4. Enable Row Level Security (RLS)
+-- 4. Enable RLS
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sessions ENABLE ROW LEVEL SECURITY;
 
--- 5. Create RLS policies to allow inserts/reads/updates using both Anon and Service Role keys
+-- 5. Drop existing policies first, then recreate cleanly
 DROP POLICY IF EXISTS "Allow public access to users" ON public.users;
 CREATE POLICY "Allow public access to users" 
 ON public.users 
