@@ -79,6 +79,7 @@ class EvaluateAnswerRequest(BaseModel):
 class SaveSessionRequest(BaseModel):
     session_id: str
     user_id: Optional[str] = None
+    user_name: Optional[str] = None
     topics: List[str]
     difficulty: str
     total_questions: int
@@ -215,6 +216,7 @@ async def save_session(req: SaveSessionRequest):
         session_data = {
             "session_id":        req.session_id,
             "user_id":           clean_user_id,
+            "user_name":         req.user_name.strip() if req.user_name else None,
             "topics":            req.topics,
             "difficulty":        req.difficulty,
             "total_questions":   req.total_questions,
