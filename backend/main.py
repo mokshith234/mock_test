@@ -3,11 +3,10 @@ PrepAI — FastAPI Backend
 Handles: secure Groq API calls, session saving, user history via Supabase
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import httpx
 import json
 import os
@@ -26,13 +25,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-#  INIT
+#  INIT & CONFIG
 # ─────────────────────────────────────────
 app = FastAPI(title="PrepAI API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # lock this to your frontend URL in production
+    allow_origins=["*"],  # Restrict in production if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,25 +42,28 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL    = "llama-3.3-70b-versatile"
 
 SUPABASE_URL  = os.getenv("SUPABASE_URL")
-SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
 
-# Verify Supabase config
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.error("SUPABASE_URL or SUPABASE_SERVICE_KEY not configured")
+supabase: Optional[Client] = None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info(f"Supabase successfully connected: {SUPABASE_URL[:30]}...")
+    except Exception as e:
+        logger.error(f"Failed to initialize Supabase client: {e}")
 else:
-    logger.info(f"Supabase configured: {SUPABASE_URL[:30]}...")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logger.warning("SUPABASE_URL or SUPABASE_SERVICE_KEY missing from environment variables.")
 
 # ─────────────────────────────────────────
 #  MODELS
 # ─────────────────────────────────────────
 class GenerateQuestionRequest(BaseModel):
-    topics: list[str]
+    topics: List[str]
     difficulty: str         # easy | medium | hard | mixed
     question_number: int
     total_questions: int
-    asked_questions: list[str] = []
+    asked_questions: List[str] = []
 
 class EvaluateAnswerRequest(BaseModel):
     question: str
@@ -72,10 +74,10 @@ class EvaluateAnswerRequest(BaseModel):
 class SaveSessionRequest(BaseModel):
     session_id: str
     user_id: Optional[str] = None
-    topics: list[str]
+    topics: List[str]
     difficulty: str
     total_questions: int
-    results: list[dict]
+    results: List[Dict[str, Any]]
     score_pct: int
     duration_seconds: Optional[int] = None
 
@@ -84,7 +86,7 @@ class GetHistoryRequest(BaseModel):
     limit: int = 10
 
 # ─────────────────────────────────────────
-#  HEALTH
+#  HEALTH ENDPOINTS
 # ─────────────────────────────────────────
 @app.get("/")
 def root():
@@ -123,11 +125,10 @@ async def call_groq(messages: list, max_tokens: int = 600) -> str:
     return response.json()["choices"][0]["message"]["content"]
 
 def parse_json_response(raw: str) -> dict:
-    clean = raw.strip().replace("```json","").replace("```","").strip()
+    clean = raw.strip().replace("```json", "").replace("```", "").strip()
     try:
         return json.loads(clean)
     except json.JSONDecodeError:
-        # try to extract JSON object from response
         start = clean.find("{")
         end   = clean.rfind("}") + 1
         if start != -1 and end > start:
@@ -142,30 +143,23 @@ async def generate_question(req: GenerateQuestionRequest):
     topics_str = ", ".join(req.topics)
     asked_str  = "\n- ".join(req.asked_questions) if req.asked_questions else "None"
 
-    # auto-escalate difficulty for mixed mode
     if req.difficulty == "mixed":
         third = req.total_questions / 3
-        diff  = "easy" if req.question_number <= third else "medium" if req.question_number <= 2*third else "hard"
+        diff  = "easy" if req.question_number <= third else "medium" if req.question_number <= 2 * third else "hard"
     else:
         diff = req.difficulty
 
-    prompt = f"""You are a senior technical interviewer at a top tech company like Google or Microsoft.
+    prompt = f"""You are a senior technical interviewer at a top tech company.
 
 Generate interview question #{req.question_number} of {req.total_questions}.
 Topics: {topics_str}
 Difficulty: {diff}
 
-Already asked (DO NOT repeat or ask something similar):
+Already asked (DO NOT repeat):
 - {asked_str}
 
-Rules:
-- One clear, specific question — no multi-part
-- Mix theory and real-world application
-- Professional tone used in actual FAANG interviews
-- Vary question style: definition, explain-why, compare, scenario, code-concept
-
 Respond ONLY with valid JSON — no markdown, no extra text:
-{{"question":"...","topic":"exact topic name from the list","difficulty":"{diff}","type":"conceptual|practical|scenario|comparison"}}"""
+{{"question":"...","topic":"exact topic name from list","difficulty":"{diff}","type":"conceptual|practical|scenario|comparison"}}"""
 
     raw  = await call_groq([{"role": "user", "content": prompt}], max_tokens=400)
     data = parse_json_response(raw)
@@ -179,25 +173,20 @@ Respond ONLY with valid JSON — no markdown, no extra text:
 async def evaluate_answer(req: EvaluateAnswerRequest):
     skipped = not req.user_answer or req.user_answer.strip() == ""
 
-    prompt = f"""You are a strict but encouraging senior technical interviewer.
+    prompt = f"""You are a senior technical interviewer.
 
 Question: {req.question}
 Topic: {req.topic}
 Candidate's answer: {req.user_answer if not skipped else "(skipped — no answer provided)"}
 
-Evaluate thoroughly. Respond ONLY with valid JSON — no markdown, no extra text:
+Evaluate thoroughly. Respond ONLY with valid JSON:
 {{
   "score": "correct" | "partial" | "wrong",
   "points": <integer 0-100>,
-  "feedback": "<2-3 sentences — what was right, what was wrong, be specific>",
-  "ideal_answer": "<clear complete answer in 3-5 sentences a senior engineer would give>",
-  "tip": "<one specific actionable improvement tip for interviews>"
-}}
-
-Scoring guide:
-- correct  = covers all key concepts accurately (80-100 pts)
-- partial  = right idea but incomplete or minor errors (40-79 pts)  
-- wrong    = incorrect, missing key concept, or skipped (0-39 pts)"""
+  "feedback": "<2-3 sentences feedback>",
+  "ideal_answer": "<3-5 sentences ideal answer>",
+  "tip": "<1 actionable tip>"
+}}"""
 
     raw        = await call_groq([{"role": "user", "content": prompt}], max_tokens=700)
     evaluation = parse_json_response(raw)
@@ -205,17 +194,22 @@ Scoring guide:
     return evaluation
 
 # ─────────────────────────────────────────
-#  SAVE SESSION
+#  SAVE SESSION (FIXED USER_ID & SUPABASE INSERT)
 # ─────────────────────────────────────────
 @app.post("/api/session/save")
 async def save_session(req: SaveSessionRequest):
-    logger.info(f"DEBUG: Saving session - {req.session_id}, user_id: {req.user_id}")
-    logger.info(f"DEBUG: Session data - topics: {req.topics}, difficulty: {req.difficulty}, score: {req.score_pct}%")
-    
+    if not supabase:
+        logger.warning("Supabase client not initialized. Session not saved to database.")
+        return {"status": "skipped", "message": "Database not configured"}
+
+    # Sanitize user_id
+    clean_user_id = req.user_id.strip() if req.user_id and req.user_id.strip() else "anonymous"
+    logger.info(f"Saving session {req.session_id} for user_id: '{clean_user_id}'")
+
     try:
         session_data = {
             "session_id":        req.session_id,
-            "user_id":           req.user_id,
+            "user_id":           clean_user_id,
             "topics":            req.topics,
             "difficulty":        req.difficulty,
             "total_questions":   req.total_questions,
@@ -227,14 +221,13 @@ async def save_session(req: SaveSessionRequest):
             "results":           req.results,
             "created_at":        datetime.utcnow().isoformat(),
         }
-        logger.info(f"DEBUG: Prepared session data: {session_data}")
-        
+
         response = supabase.table("sessions").insert(session_data).execute()
-        logger.info(f"DEBUG: Supabase insert response: {response}")
-        
-        return {"status": "saved", "session_id": req.session_id}
+        logger.info(f"Supabase insert success: {response}")
+        return {"status": "saved", "session_id": req.session_id, "user_id": clean_user_id}
+
     except Exception as e:
-        logger.error(f"ERROR saving session: {str(e)}", exc_info=True)
+        logger.error(f"ERROR saving session to Supabase: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to save session: {str(e)}")
 
 # ─────────────────────────────────────────
@@ -242,18 +235,21 @@ async def save_session(req: SaveSessionRequest):
 # ─────────────────────────────────────────
 @app.get("/api/history/{user_id}")
 async def get_history(user_id: str, limit: int = 10):
+    if not supabase:
+        return {"sessions": []}
+
+    clean_user_id = user_id.strip()
     try:
-        logger.info(f"DEBUG: Fetching history for user: {user_id}")
+        logger.info(f"Fetching history for user_id: '{clean_user_id}'")
         resp = (
             supabase.table("sessions")
             .select("session_id,topics,difficulty,total_questions,correct,partial,wrong,score_pct,duration_seconds,created_at")
-            .eq("user_id", user_id)
+            .eq("user_id", clean_user_id)
             .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
-        logger.info(f"DEBUG: Retrieved {len(resp.data)} sessions")
-        return {"sessions": resp.data}
+        return {"sessions": resp.data or []}
     except Exception as e:
         logger.error(f"ERROR fetching history: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -263,8 +259,10 @@ async def get_history(user_id: str, limit: int = 10):
 # ─────────────────────────────────────────
 @app.get("/api/session/{session_id}")
 async def get_session(session_id: str):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database connection uninitialized")
+
     try:
-        logger.info(f"DEBUG: Fetching session: {session_id}")
         resp = (
             supabase.table("sessions")
             .select("*")
@@ -272,7 +270,6 @@ async def get_session(session_id: str):
             .single()
             .execute()
         )
-        logger.info(f"DEBUG: Retrieved session")
         return resp.data
     except Exception as e:
         logger.error(f"ERROR fetching session: {str(e)}", exc_info=True)
@@ -281,10 +278,13 @@ async def get_session(session_id: str):
 # ─────────────────────────────────────────
 #  LEADERBOARD
 # ─────────────────────────────────────────
+
 @app.get("/api/leaderboard")
 async def get_leaderboard(topic: Optional[str] = None, limit: int = 10):
+    if not supabase:
+        return {"leaderboard": []}
+
     try:
-        logger.info(f"DEBUG: Fetching leaderboard, topic: {topic}")
         query = (
             supabase.table("sessions")
             .select("user_id,score_pct,topics,total_questions,created_at")
@@ -294,8 +294,7 @@ async def get_leaderboard(topic: Optional[str] = None, limit: int = 10):
         if topic:
             query = query.contains("topics", [topic])
         resp = query.execute()
-        logger.info(f"DEBUG: Retrieved {len(resp.data)} leaderboard entries")
-        return {"leaderboard": resp.data}
+        return {"leaderboard": resp.data or []}
     except Exception as e:
         logger.error(f"ERROR fetching leaderboard: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
