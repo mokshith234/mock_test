@@ -92,6 +92,10 @@ class VerifyOtpRequest(BaseModel):
     name: str
     otp: str
 
+class VerifyTokenRequest(BaseModel):
+    access_token: str
+    name: str
+
 class SaveSessionRequest(BaseModel):
     session_id: str
     user_id: Optional[str] = None
@@ -270,7 +274,7 @@ async def send_otp(req: SendOtpRequest, request: Request):
     if not verify_email_exists(clean_email):
         return {"status": "error", "code": "INVALID_EMAIL", "message": "The email address does not exist or is unreachable."}
         
-    # If name is provided, verify it's unique and save the user immediately
+    # If name is provided, verify it's unique
     if clean_name:
         try:
             existing_user_resp = supabase.table("users").select("email").ilike("name", clean_name).execute()
@@ -278,16 +282,9 @@ async def send_otp(req: SendOtpRequest, request: Request):
                 for user in existing_user_resp.data:
                     if user["email"] != clean_email:
                         return {"status": "error", "code": "NAME_EXISTS", "message": "Username already exists. Please choose a different name."}
-
-            user_data = {
-                "email": clean_email,
-                "name": clean_name,
-                "last_active": datetime.utcnow().isoformat()
-            }
-            supabase.table("users").upsert(user_data, on_conflict="email").execute()
         except Exception as e:
-            logger.error(f"ERROR saving user to Supabase: {str(e)}", exc_info=True)
-            return {"status": "error", "detail": f"Failed to save user: {str(e)}"}
+            logger.error(f"ERROR verifying name uniqueness: {str(e)}", exc_info=True)
+            return {"status": "error", "detail": f"Failed to check username: {str(e)}"}
 
     origin = request.headers.get("origin") or request.headers.get("referer")
     if origin and origin.endswith('/'):
@@ -305,34 +302,26 @@ async def send_otp(req: SendOtpRequest, request: Request):
         return {"status": "success", "message": "Confirmation email sent."}
     except Exception as e:
         logger.error(f"ERROR sending email: {str(e)}", exc_info=True)
-        # Even if email fails, we return success so the user can proceed without being blocked
-        return {"status": "success", "message": "Proceeding without email confirmation due to server issue."}
+        return {"status": "error", "message": "Proceeding without email confirmation due to server issue."}
 
-@app.post("/api/user/verify-and-save")
-async def verify_and_save_user(req: VerifyOtpRequest):
+@app.post("/api/user/verify-token")
+async def verify_token_and_save(req: VerifyTokenRequest):
     if not supabase:
         logger.warning("Supabase client not initialized. User not saved to database.")
         return {"status": "skipped", "message": "Database not configured"}
 
-    clean_email = req.email.strip().lower()
     clean_name = req.name.strip()
-    logger.info(f"Verifying OTP and saving user info for email: '{clean_email}', name: '{clean_name}'")
     
-    # 1. Verify OTP
-    if req.otp.strip() == "123456":
-        logger.info("Using backdoor OTP '123456' for development")
-    else:
-        try:
-            auth_resp = supabase.auth.verify_otp({
-                "email": clean_email,
-                "token": req.otp.strip(),
-                "type": "email"
-            })
-            if not auth_resp.user:
-                return {"status": "error", "code": "INVALID_OTP", "message": "Invalid OTP code."}
-        except Exception as e:
-            logger.error(f"OTP Verification failed: {str(e)}")
-            return {"status": "error", "code": "INVALID_OTP", "message": "Invalid or expired OTP code."}
+    # 1. Verify token with Supabase
+    try:
+        user_resp = supabase.auth.get_user(req.access_token)
+        if not user_resp or not user_resp.user:
+            return {"status": "error", "code": "INVALID_TOKEN", "message": "Invalid or expired session token."}
+            
+        clean_email = user_resp.user.email.strip().lower()
+    except Exception as e:
+        logger.error(f"Token Verification failed: {str(e)}")
+        return {"status": "error", "code": "INVALID_TOKEN", "message": "Failed to verify session token."}
 
     try:
         # Check if the name exists for a different email
