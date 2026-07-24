@@ -18,6 +18,8 @@ import logging
 import dns.resolver
 import smtplib
 import socket
+import secrets
+import hashlib
 
 load_dotenv()
 
@@ -51,6 +53,7 @@ SUPABASE_KEY  = (
     os.getenv("SUPABASE_KEY") or 
     os.getenv("SUPABASE_ANON_KEY")
 )
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
 supabase: Optional[Client] = None
 
@@ -62,6 +65,11 @@ if SUPABASE_URL and SUPABASE_KEY:
         logger.error(f"Failed to initialize Supabase client: {e}")
 else:
     logger.warning("SUPABASE_URL or SUPABASE_KEY missing from environment variables.")
+
+if RESEND_API_KEY:
+    logger.info("Resend API key configured for email delivery.")
+else:
+    logger.warning("RESEND_API_KEY missing. Email verification will not work.")
 
 # ─────────────────────────────────────────
 #  MODELS
@@ -93,7 +101,7 @@ class VerifyOtpRequest(BaseModel):
     otp: str
 
 class VerifyTokenRequest(BaseModel):
-    access_token: str
+    token: str
     name: str
 
 class SaveSessionRequest(BaseModel):
@@ -267,6 +275,8 @@ def verify_email_exists(email: str) -> bool:
 async def send_otp(req: SendOtpRequest, request: Request):
     if not supabase:
         return {"status": "error", "message": "Database not configured"}
+    if not RESEND_API_KEY:
+        return {"status": "error", "message": "Email service not configured (RESEND_API_KEY missing)"}
         
     clean_email = req.email.strip().lower()
     clean_name = req.name.strip() if req.name else None
@@ -286,23 +296,62 @@ async def send_otp(req: SendOtpRequest, request: Request):
             logger.error(f"ERROR verifying name uniqueness: {str(e)}", exc_info=True)
             return {"status": "error", "detail": f"Failed to check username: {str(e)}"}
 
-    origin = request.headers.get("origin") or request.headers.get("referer")
-    if origin and origin.endswith('/'):
-        origin = origin[:-1]
+    # Generate a secure token
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    expires_at = datetime.utcnow().isoformat()
 
-    auth_options = {}
-    if origin:
-        auth_options["email_redirect_to"] = origin
-
+    # Store token hash in DB
     try:
-        if auth_options:
-            supabase.auth.sign_in_with_otp({"email": clean_email, "options": auth_options})
-        else:
-            supabase.auth.sign_in_with_otp({"email": clean_email})
-        return {"status": "success", "message": "Confirmation email sent."}
+        # Clean up any old tokens for this email
+        supabase.table("verification_tokens").delete().eq("email", clean_email).execute()
+        supabase.table("verification_tokens").insert({
+            "email": clean_email,
+            "token_hash": token_hash,
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
     except Exception as e:
-        logger.error(f"ERROR sending email: {str(e)}", exc_info=True)
-        return {"status": "error", "message": "Proceeding without email confirmation due to server issue."}
+        logger.error(f"ERROR storing verification token: {str(e)}", exc_info=True)
+        return {"status": "error", "message": "Failed to create verification token."}
+
+    # Build the verification link
+    origin = request.headers.get("origin") or request.headers.get("referer") or ""
+    if origin.endswith('/'):
+        origin = origin[:-1]
+    verify_link = f"{origin}#token={raw_token}"
+
+    # Send email via Resend
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": "PrepAI <onboarding@resend.dev>",
+                    "to": [clean_email],
+                    "subject": "PrepAI — Verify your email to start your interview",
+                    "html": f"""
+                    <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:40px 20px;">
+                        <h2 style="color:#333;">PrepAI Interview Verification</h2>
+                        <p style="color:#555;font-size:16px;line-height:1.6;">Click the button below to verify your email and start your mock interview session.</p>
+                        <a href="{verify_link}" style="display:inline-block;padding:14px 28px;background:#635BFF;color:white;text-decoration:none;border-radius:8px;font-size:16px;font-weight:600;margin:20px 0;">Start Interview →</a>
+                        <p style="color:#999;font-size:13px;">This link expires in 30 minutes. If you didn't request this, you can ignore this email.</p>
+                    </div>
+                    """,
+                },
+            )
+            if resp.status_code >= 400:
+                logger.error(f"Resend API error: {resp.status_code} {resp.text}")
+                return {"status": "error", "message": f"Failed to send email: {resp.text}"}
+        
+        logger.info(f"Verification email sent to {clean_email} via Resend")
+        return {"status": "success", "message": "Verification email sent! Check your inbox."}
+    except Exception as e:
+        logger.error(f"ERROR sending email via Resend: {str(e)}", exc_info=True)
+        return {"status": "error", "message": f"Failed to send email: {str(e)}"}
 
 @app.post("/api/user/verify-token")
 async def verify_token_and_save(req: VerifyTokenRequest):
@@ -311,20 +360,32 @@ async def verify_token_and_save(req: VerifyTokenRequest):
         return {"status": "skipped", "message": "Database not configured"}
 
     clean_name = req.name.strip()
+    token_hash = hashlib.sha256(req.token.encode()).hexdigest()
     
-    # 1. Verify token with Supabase
+    # 1. Look up the token in our DB
     try:
-        user_resp = supabase.auth.get_user(req.access_token)
-        if not user_resp or not user_resp.user:
-            return {"status": "error", "code": "INVALID_TOKEN", "message": "Invalid or expired session token."}
-            
-        clean_email = user_resp.user.email.strip().lower()
+        token_resp = supabase.table("verification_tokens").select("*").eq("token_hash", token_hash).execute()
+        if not token_resp.data:
+            return {"status": "error", "code": "INVALID_TOKEN", "message": "Invalid or expired verification link."}
+        
+        token_record = token_resp.data[0]
+        clean_email = token_record["email"]
+        
+        # Check if token is older than 30 minutes
+        created_at = datetime.fromisoformat(token_record["created_at"].replace("Z", "+00:00").replace("+00:00", ""))
+        age_minutes = (datetime.utcnow() - created_at).total_seconds() / 60
+        if age_minutes > 30:
+            supabase.table("verification_tokens").delete().eq("token_hash", token_hash).execute()
+            return {"status": "error", "code": "INVALID_TOKEN", "message": "Verification link has expired. Please request a new one."}
+        
+        # Delete the token (single use)
+        supabase.table("verification_tokens").delete().eq("token_hash", token_hash).execute()
     except Exception as e:
-        logger.error(f"Token Verification failed: {str(e)}")
-        return {"status": "error", "code": "INVALID_TOKEN", "message": "Failed to verify session token."}
+        logger.error(f"Token lookup failed: {str(e)}")
+        return {"status": "error", "code": "INVALID_TOKEN", "message": "Failed to verify token."}
 
+    # 2. Save user
     try:
-        # Check if the name exists for a different email
         existing_user_resp = supabase.table("users").select("email").ilike("name", clean_name).execute()
         if existing_user_resp.data:
             for user in existing_user_resp.data:
