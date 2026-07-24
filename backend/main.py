@@ -283,6 +283,18 @@ async def send_otp(req: SendOtpRequest, request: Request):
 
     if not verify_email_exists(clean_email):
         return {"status": "error", "code": "INVALID_EMAIL", "message": "The email address does not exist or is unreachable."}
+
+    # Check if user already exists in our database — skip verification for returning users
+    try:
+        existing_user = supabase.table("users").select("name, email").eq("email", clean_email).execute()
+        if existing_user.data:
+            stored_name = existing_user.data[0]["name"]
+            # Update last_active timestamp
+            supabase.table("users").update({"last_active": datetime.utcnow().isoformat()}).eq("email", clean_email).execute()
+            logger.info(f"Returning user detected: {clean_email} ({stored_name})")
+            return {"status": "existing_user", "name": stored_name, "email": clean_email}
+    except Exception as e:
+        logger.error(f"Error checking existing user: {str(e)}", exc_info=True)
         
     # If name is provided, verify it's unique
     if clean_name:
