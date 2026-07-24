@@ -16,12 +16,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import logging
 import dns.resolver
-import smtplib
 import socket
-import secrets
-import hashlib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 load_dotenv()
 
@@ -52,12 +47,6 @@ SUPABASE_URL  = os.getenv("SUPABASE_URL")
 SUPABASE_KEY  = (
     os.getenv("SUPABASE_SERVICE_ROLE_KEY") or 
     os.getenv("SUPABASE_SERVICE_KEY") or 
-    os.getenv("SUPABASE_KEY") or 
-    os.getenv("SUPABASE_ANON_KEY")
-)
-GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-
 supabase: Optional[Client] = None
 
 if SUPABASE_URL and SUPABASE_KEY:
@@ -68,11 +57,6 @@ if SUPABASE_URL and SUPABASE_KEY:
         logger.error(f"Failed to initialize Supabase client: {e}")
 else:
     logger.warning("SUPABASE_URL or SUPABASE_KEY missing from environment variables.")
-
-if GMAIL_ADDRESS and GMAIL_APP_PASSWORD:
-    logger.info("Gmail SMTP configured for email delivery.")
-else:
-    logger.warning("GMAIL_ADDRESS or GMAIL_APP_PASSWORD missing. Email verification will not work.")
 
 # ─────────────────────────────────────────
 #  MODELS
@@ -94,17 +78,8 @@ class SaveUserRequest(BaseModel):
     email: str
     name: str
 
-class SendOtpRequest(BaseModel):
+class LoginRequest(BaseModel):
     email: str
-    name: Optional[str] = None
-
-class VerifyOtpRequest(BaseModel):
-    email: str
-    name: str
-    otp: str
-
-class VerifyTokenRequest(BaseModel):
-    token: str
     name: str
 
 class SaveSessionRequest(BaseModel):
@@ -274,147 +249,58 @@ def verify_email_exists(email: str) -> bool:
     except Exception:
         return False
 
-@app.post("/api/user/send-otp")
-async def send_otp(req: SendOtpRequest, request: Request):
+@app.post("/api/user/login")
+async def user_login(req: LoginRequest):
     if not supabase:
         return {"status": "error", "message": "Database not configured"}
-    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        return {"status": "error", "message": "Email service not configured (Gmail credentials missing)"}
         
     clean_email = req.email.strip().lower()
-    clean_name = req.name.strip() if req.name else None
+    clean_name = req.name.strip()
 
     if not verify_email_exists(clean_email):
         return {"status": "error", "code": "INVALID_EMAIL", "message": "The email address does not exist or is unreachable."}
 
-    # Check if user already exists in our database — skip verification for returning users
     try:
-        existing_user = supabase.table("users").select("name, email").eq("email", clean_email).execute()
-        if existing_user.data:
-            stored_name = existing_user.data[0]["name"]
-            # Update last_active timestamp
+        # Check if email exists in DB
+        existing_user_by_email = supabase.table("users").select("*").eq("email", clean_email).execute()
+        
+        if existing_user_by_email.data:
+            stored_name = existing_user_by_email.data[0]["name"]
+            
+            # Strict validation: Ensure name matches exactly
+            if stored_name.lower() != clean_name.lower():
+                return {
+                    "status": "error", 
+                    "code": "NAME_MISMATCH", 
+                    "message": f"This email is registered to a different name. Please use the correct name."
+                }
+                
+            # Name matches, returning user
             supabase.table("users").update({"last_active": datetime.utcnow().isoformat()}).eq("email", clean_email).execute()
             logger.info(f"Returning user detected: {clean_email} ({stored_name})")
             return {"status": "existing_user", "name": stored_name, "email": clean_email}
-    except Exception as e:
-        logger.error(f"Error checking existing user: {str(e)}", exc_info=True)
-        
-    # If name is provided, verify it's unique
-    if clean_name:
-        try:
-            existing_user_resp = supabase.table("users").select("email").ilike("name", clean_name).execute()
-            if existing_user_resp.data:
-                for user in existing_user_resp.data:
+            
+        else:
+            # Check if name is taken by a different email
+            existing_user_by_name = supabase.table("users").select("email").ilike("name", clean_name).execute()
+            if existing_user_by_name.data:
+                for user in existing_user_by_name.data:
                     if user["email"] != clean_email:
                         return {"status": "error", "code": "NAME_EXISTS", "message": "Username already exists. Please choose a different name."}
-        except Exception as e:
-            logger.error(f"ERROR verifying name uniqueness: {str(e)}", exc_info=True)
-            return {"status": "error", "detail": f"Failed to check username: {str(e)}"}
-
-    # Generate a secure token
-    raw_token = secrets.token_urlsafe(48)
-    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-    expires_at = datetime.utcnow().isoformat()
-
-    # Store token hash in DB
-    try:
-        # Clean up any old tokens for this email
-        supabase.table("verification_tokens").delete().eq("email", clean_email).execute()
-        supabase.table("verification_tokens").insert({
-            "email": clean_email,
-            "token_hash": token_hash,
-            "created_at": datetime.utcnow().isoformat(),
-        }).execute()
+                        
+            # Safe to create new user
+            user_data = {
+                "email": clean_email,
+                "name": clean_name,
+                "last_active": datetime.utcnow().isoformat()
+            }
+            supabase.table("users").insert(user_data).execute()
+            logger.info(f"New user registered: {clean_email} ({clean_name})")
+            return {"status": "new_user", "name": clean_name, "email": clean_email}
+            
     except Exception as e:
-        logger.error(f"ERROR storing verification token: {str(e)}", exc_info=True)
-        return {"status": "error", "message": "Failed to create verification token."}
-
-    # Build the verification link
-    origin = request.headers.get("origin") or request.headers.get("referer") or ""
-    if origin.endswith('/'):
-        origin = origin[:-1]
-    verify_link = f"{origin}#token={raw_token}"
-
-    # Send email via Gmail SMTP
-    try:
-        msg = MIMEMultipart()
-        msg["From"] = f"PrepAI <{GMAIL_ADDRESS}>"
-        msg["To"] = clean_email
-        msg["Subject"] = "PrepAI — Verify your email to start your interview"
-        
-        html_content = f"""
-        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:40px 20px;">
-            <h2 style="color:#333;">PrepAI Interview Verification</h2>
-            <p style="color:#555;font-size:16px;line-height:1.6;">Click the button below to verify your email and start your mock interview session.</p>
-            <a href="{verify_link}" style="display:inline-block;padding:14px 28px;background:#635BFF;color:white;text-decoration:none;border-radius:8px;font-size:16px;font-weight:600;margin:20px 0;">Start Interview →</a>
-            <p style="color:#999;font-size:13px;">This link expires in 30 minutes. If you didn't request this, you can ignore this email.</p>
-        </div>
-        """
-        msg.attach(MIMEText(html_content, "html"))
-        
-        # Connect to Gmail SMTP server
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        
-        logger.info(f"Verification email sent to {clean_email} via Gmail SMTP")
-        return {"status": "success", "message": "Verification email sent! Check your inbox."}
-    except Exception as e:
-        logger.error(f"ERROR sending email via Gmail SMTP: {str(e)}", exc_info=True)
-        return {"status": "error", "message": f"Failed to send email: {str(e)}"}
-
-@app.post("/api/user/verify-token")
-async def verify_token_and_save(req: VerifyTokenRequest):
-    if not supabase:
-        logger.warning("Supabase client not initialized. User not saved to database.")
-        return {"status": "skipped", "message": "Database not configured"}
-
-    clean_name = req.name.strip()
-    token_hash = hashlib.sha256(req.token.encode()).hexdigest()
-    
-    # 1. Look up the token in our DB
-    try:
-        token_resp = supabase.table("verification_tokens").select("*").eq("token_hash", token_hash).execute()
-        if not token_resp.data:
-            return {"status": "error", "code": "INVALID_TOKEN", "message": "Invalid or expired verification link."}
-        
-        token_record = token_resp.data[0]
-        clean_email = token_record["email"]
-        
-        # Check if token is older than 30 minutes
-        created_at = datetime.fromisoformat(token_record["created_at"].replace("Z", "+00:00").replace("+00:00", ""))
-        age_minutes = (datetime.utcnow() - created_at).total_seconds() / 60
-        if age_minutes > 30:
-            supabase.table("verification_tokens").delete().eq("token_hash", token_hash).execute()
-            return {"status": "error", "code": "INVALID_TOKEN", "message": "Verification link has expired. Please request a new one."}
-        
-        # Delete the token (single use)
-        supabase.table("verification_tokens").delete().eq("token_hash", token_hash).execute()
-    except Exception as e:
-        logger.error(f"Token lookup failed: {str(e)}")
-        return {"status": "error", "code": "INVALID_TOKEN", "message": "Failed to verify token."}
-
-    # 2. Save user
-    try:
-        existing_user_resp = supabase.table("users").select("email").ilike("name", clean_name).execute()
-        if existing_user_resp.data:
-            for user in existing_user_resp.data:
-                if user["email"] != clean_email:
-                    return {"status": "error", "code": "NAME_EXISTS", "message": "Username already exists. Please choose a different name."}
-
-        user_data = {
-            "email": clean_email,
-            "name": clean_name,
-            "last_active": datetime.utcnow().isoformat()
-        }
-        response = supabase.table("users").upsert(user_data, on_conflict="email").execute()
-        logger.info(f"Supabase user save success: {response}")
-        return {"status": "saved", "email": clean_email, "name": clean_name}
-    except Exception as e:
-        logger.error(f"ERROR saving user to Supabase: {str(e)}", exc_info=True)
-        return {"status": "error", "detail": str(e)}
+        logger.error(f"Error during login: {str(e)}", exc_info=True)
+        return {"status": "error", "message": "Failed to process login."}
 
 # ─────────────────────────────────────────
 #  SAVE SESSION (FIXED USER_ID & SUPABASE INSERT)

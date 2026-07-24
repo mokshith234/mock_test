@@ -61,20 +61,4 @@ USING (true);
 
 -- 6. Create VERIFICATION_TOKENS table (for self-managed email verification)
 CREATE TABLE IF NOT EXISTS public.verification_tokens (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email TEXT NOT NULL,
-    token_hash TEXT UNIQUE NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_verification_tokens_hash ON public.verification_tokens (token_hash);
-CREATE INDEX IF NOT EXISTS idx_verification_tokens_email ON public.verification_tokens (email);
-
-ALTER TABLE public.verification_tokens ENABLE ROW LEVEL SECURITY;
-
-DROP POLICY IF EXISTS "Allow public access to verification_tokens" ON public.verification_tokens;
-CREATE POLICY "Allow public access to verification_tokens" 
-ON public.verification_tokens 
-FOR ALL 
-USING (true) 
 WITH CHECK (true);
