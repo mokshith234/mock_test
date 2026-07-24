@@ -20,6 +20,8 @@ import smtplib
 import socket
 import secrets
 import hashlib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 load_dotenv()
 
@@ -53,7 +55,8 @@ SUPABASE_KEY  = (
     os.getenv("SUPABASE_KEY") or 
     os.getenv("SUPABASE_ANON_KEY")
 )
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 supabase: Optional[Client] = None
 
@@ -66,10 +69,10 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     logger.warning("SUPABASE_URL or SUPABASE_KEY missing from environment variables.")
 
-if RESEND_API_KEY:
-    logger.info("Resend API key configured for email delivery.")
+if GMAIL_ADDRESS and GMAIL_APP_PASSWORD:
+    logger.info("Gmail SMTP configured for email delivery.")
 else:
-    logger.warning("RESEND_API_KEY missing. Email verification will not work.")
+    logger.warning("GMAIL_ADDRESS or GMAIL_APP_PASSWORD missing. Email verification will not work.")
 
 # ─────────────────────────────────────────
 #  MODELS
@@ -275,8 +278,8 @@ def verify_email_exists(email: str) -> bool:
 async def send_otp(req: SendOtpRequest, request: Request):
     if not supabase:
         return {"status": "error", "message": "Database not configured"}
-    if not RESEND_API_KEY:
-        return {"status": "error", "message": "Email service not configured (RESEND_API_KEY missing)"}
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        return {"status": "error", "message": "Email service not configured (Gmail credentials missing)"}
         
     clean_email = req.email.strip().lower()
     clean_name = req.name.strip() if req.name else None
@@ -332,37 +335,34 @@ async def send_otp(req: SendOtpRequest, request: Request):
         origin = origin[:-1]
     verify_link = f"{origin}#token={raw_token}"
 
-    # Send email via Resend
+    # Send email via Gmail SMTP
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {RESEND_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "from": "PrepAI <onboarding@resend.dev>",
-                    "to": [clean_email],
-                    "subject": "PrepAI — Verify your email to start your interview",
-                    "html": f"""
-                    <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:40px 20px;">
-                        <h2 style="color:#333;">PrepAI Interview Verification</h2>
-                        <p style="color:#555;font-size:16px;line-height:1.6;">Click the button below to verify your email and start your mock interview session.</p>
-                        <a href="{verify_link}" style="display:inline-block;padding:14px 28px;background:#635BFF;color:white;text-decoration:none;border-radius:8px;font-size:16px;font-weight:600;margin:20px 0;">Start Interview →</a>
-                        <p style="color:#999;font-size:13px;">This link expires in 30 minutes. If you didn't request this, you can ignore this email.</p>
-                    </div>
-                    """,
-                },
-            )
-            if resp.status_code >= 400:
-                logger.error(f"Resend API error: {resp.status_code} {resp.text}")
-                return {"status": "error", "message": f"Failed to send email: {resp.text}"}
+        msg = MIMEMultipart()
+        msg["From"] = f"PrepAI <{GMAIL_ADDRESS}>"
+        msg["To"] = clean_email
+        msg["Subject"] = "PrepAI — Verify your email to start your interview"
         
-        logger.info(f"Verification email sent to {clean_email} via Resend")
+        html_content = f"""
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:40px 20px;">
+            <h2 style="color:#333;">PrepAI Interview Verification</h2>
+            <p style="color:#555;font-size:16px;line-height:1.6;">Click the button below to verify your email and start your mock interview session.</p>
+            <a href="{verify_link}" style="display:inline-block;padding:14px 28px;background:#635BFF;color:white;text-decoration:none;border-radius:8px;font-size:16px;font-weight:600;margin:20px 0;">Start Interview →</a>
+            <p style="color:#999;font-size:13px;">This link expires in 30 minutes. If you didn't request this, you can ignore this email.</p>
+        </div>
+        """
+        msg.attach(MIMEText(html_content, "html"))
+        
+        # Connect to Gmail SMTP server
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        
+        logger.info(f"Verification email sent to {clean_email} via Gmail SMTP")
         return {"status": "success", "message": "Verification email sent! Check your inbox."}
     except Exception as e:
-        logger.error(f"ERROR sending email via Resend: {str(e)}", exc_info=True)
+        logger.error(f"ERROR sending email via Gmail SMTP: {str(e)}", exc_info=True)
         return {"status": "error", "message": f"Failed to send email: {str(e)}"}
 
 @app.post("/api/user/verify-token")

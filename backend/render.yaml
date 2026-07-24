@@ -9,7 +9,7 @@ services:
         sync: false
       - key: SUPABASE_URL
         sync: false
-      - key: SUPABASE_SERVICE_KEY
+      - key: GMAIL_ADDRESS
         sync: false
-      - key: RESEND_API_KEY
+      - key: GMAIL_APP_PASSWORD
         sync: false
