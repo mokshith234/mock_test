@@ -83,6 +83,14 @@ class SaveUserRequest(BaseModel):
     email: str
     name: str
 
+class SendOtpRequest(BaseModel):
+    email: str
+
+class VerifyOtpRequest(BaseModel):
+    email: str
+    name: str
+    otp: str
+
 class SaveSessionRequest(BaseModel):
     session_id: str
     user_id: Optional[str] = None
@@ -250,18 +258,44 @@ def verify_email_exists(email: str) -> bool:
     except Exception:
         return False
 
-@app.post("/api/user/save")
-async def save_user(req: SaveUserRequest):
+@app.post("/api/user/send-otp")
+async def send_otp(req: SendOtpRequest):
+    if not supabase:
+        return {"status": "error", "message": "Database not configured"}
+        
+    clean_email = req.email.strip().lower()
+    if not verify_email_exists(clean_email):
+        return {"status": "error", "code": "INVALID_EMAIL", "message": "The email address does not exist or is unreachable."}
+        
+    try:
+        supabase.auth.sign_in_with_otp({"email": clean_email})
+        return {"status": "success", "message": "OTP sent"}
+    except Exception as e:
+        logger.error(f"ERROR sending OTP: {str(e)}", exc_info=True)
+        return {"status": "error", "message": "Failed to send OTP. Ensure Supabase Auth is enabled for emails."}
+
+@app.post("/api/user/verify-and-save")
+async def verify_and_save_user(req: VerifyOtpRequest):
     if not supabase:
         logger.warning("Supabase client not initialized. User not saved to database.")
         return {"status": "skipped", "message": "Database not configured"}
 
     clean_email = req.email.strip().lower()
     clean_name = req.name.strip()
-    logger.info(f"Saving user info for email: '{clean_email}', name: '{clean_name}'")
+    logger.info(f"Verifying OTP and saving user info for email: '{clean_email}', name: '{clean_name}'")
     
-    if not verify_email_exists(clean_email):
-        return {"status": "error", "code": "INVALID_EMAIL", "message": "The email address does not exist or is unreachable."}
+    # 1. Verify OTP
+    try:
+        auth_resp = supabase.auth.verify_otp({
+            "email": clean_email,
+            "token": req.otp.strip(),
+            "type": "email"
+        })
+        if not auth_resp.user:
+            return {"status": "error", "code": "INVALID_OTP", "message": "Invalid OTP code."}
+    except Exception as e:
+        logger.error(f"OTP Verification failed: {str(e)}")
+        return {"status": "error", "code": "INVALID_OTP", "message": "Invalid or expired OTP code."}
 
     try:
         # Check if the name exists for a different email
