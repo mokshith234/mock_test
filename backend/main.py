@@ -15,6 +15,9 @@ from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import logging
+import dns.resolver
+import smtplib
+import socket
 
 load_dotenv()
 
@@ -206,6 +209,47 @@ Evaluate thoroughly. Respond ONLY with valid JSON:
 # ─────────────────────────────────────────
 #  SAVE USER (IMMEDIATE ON START)
 # ─────────────────────────────────────────
+def verify_email_exists(email: str) -> bool:
+    """
+    Checks if the email's domain has MX records and does a basic SMTP ping.
+    Note: Some providers (like Gmail/Yahoo) might still accept or block the ping, 
+    so this isn't 100% foolproof, but it catches most fake emails.
+    """
+    try:
+        domain = email.split('@')[1]
+        
+        # 1. Check MX records
+        try:
+            records = dns.resolver.resolve(domain, 'MX')
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout):
+            return False
+            
+        mx_record = str(records[0].exchange)
+        
+        # 2. SMTP Ping
+        try:
+            server = smtplib.SMTP(timeout=3)
+            server.set_debuglevel(0)
+            server.connect(mx_record)
+            server.helo(server.local_hostname or socket.gethostname())
+            server.mail('verify@example.com')
+            code, message = server.rcpt(email)
+            server.quit()
+            
+            # SMTP code 250 means OK (user exists)
+            # Code 550 means user unknown
+            # Other codes (like 451) usually mean greylisting, which means domain is real
+            if code == 550:
+                return False
+                
+            return True
+        except Exception:
+            # If we fail to connect but MX exists, we assume it's valid to avoid false negatives
+            return True
+            
+    except Exception:
+        return False
+
 @app.post("/api/user/save")
 async def save_user(req: SaveUserRequest):
     if not supabase:
@@ -215,8 +259,18 @@ async def save_user(req: SaveUserRequest):
     clean_email = req.email.strip().lower()
     clean_name = req.name.strip()
     logger.info(f"Saving user info for email: '{clean_email}', name: '{clean_name}'")
+    
+    if not verify_email_exists(clean_email):
+        return {"status": "error", "code": "INVALID_EMAIL", "message": "The email address does not exist or is unreachable."}
 
     try:
+        # Check if the name exists for a different email
+        existing_user_resp = supabase.table("users").select("email").ilike("name", clean_name).execute()
+        if existing_user_resp.data:
+            for user in existing_user_resp.data:
+                if user["email"] != clean_email:
+                    return {"status": "error", "code": "NAME_EXISTS", "message": "Username already exists. Please choose a different name."}
+
         user_data = {
             "email": clean_email,
             "name": clean_name,
