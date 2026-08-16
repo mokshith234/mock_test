@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import logging
 import dns.resolver
 import socket
+import smtplib
 
 load_dotenv()
 
@@ -196,13 +197,13 @@ Topic: {req.topic}
 Candidate's answer: {req.user_answer if not skipped else "(skipped — no answer provided)"}
 
 Evaluate thoroughly. Respond ONLY with valid JSON:
-{{
+{
   "score": "correct" | "partial" | "wrong",
   "points": <integer 0-100>,
   "feedback": "<2-3 sentences feedback>",
   "ideal_answer": "<3-5 sentences ideal answer>",
   "tip": "<1 actionable tip>"
-}}"""
+}"""
 
     raw        = await call_groq([{"role": "user", "content": prompt}], max_tokens=700)
     evaluation = parse_json_response(raw)
@@ -214,42 +215,24 @@ Evaluate thoroughly. Respond ONLY with valid JSON:
 # ─────────────────────────────────────────
 def verify_email_exists(email: str) -> bool:
     """
-    Checks if the email's domain has MX records and does a basic SMTP ping.
-    Note: Some providers (like Gmail/Yahoo) might still accept or block the ping, 
-    so this isn't 100% foolproof, but it catches most fake emails.
+    Checks if the email's domain has MX records.
+
+    NOTE: Performing an SMTP "ping" (RCPT TO) is unreliable in many environments
+    (many providers block or rate-limit such probes) and can cause false negatives.
+    This function therefore only validates that the domain has MX records.
     """
     try:
         domain = email.split('@')[1]
-        
+
         # 1. Check MX records
         try:
             records = dns.resolver.resolve(domain, 'MX')
         except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout):
             return False
-            
-        mx_record = str(records[0].exchange)
-        
-        # 2. SMTP Ping
-        try:
-            server = smtplib.SMTP(timeout=3)
-            server.set_debuglevel(0)
-            server.connect(mx_record)
-            server.helo(server.local_hostname or socket.gethostname())
-            server.mail('verify@example.com')
-            code, message = server.rcpt(email)
-            server.quit()
-            
-            # SMTP code 250 means OK (user exists)
-            # Code 550 means user unknown
-            # Other codes (like 451) usually mean greylisting, which means domain is real
-            if code == 550:
-                return False
-                
-            return True
-        except Exception:
-            # If we fail to connect but MX exists, we assume it's valid to avoid false negatives
-            return True
-            
+
+        # If MX records exist, consider the email domain valid.
+        return True
+
     except Exception:
         return False
 
